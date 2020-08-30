@@ -21,27 +21,27 @@ struct Options {
     host: String,
 
     /// port
-    #[argh(option, default = "443")]
+    #[argh(option, short = 'p', default = "443")]
     port: u16,
 
     /// domain
-    #[argh(option)]
+    #[argh(option, short = 'd')]
     domain: Option<String>,
 
     /// cafile
-    #[argh(option)]
+    #[argh(option, short = 'c')]
     cafile: Option<PathBuf>,
 
     /// concurrent number
-    #[argh(option, default = "1")]
+    #[argh(option, short = 'n', default = "1")]
     concurrent: usize,
 
     /// input file
-    #[argh(option)]
+    #[argh(option, short = 'i')]
     input: Option<PathBuf>,
 
     /// keep test time (s)
-    #[argh(option)]
+    #[argh(option, short = 'k')]
     keep: Option<u64>
 }
 

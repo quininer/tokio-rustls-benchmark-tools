@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::net::{ ToSocketAddrs, SocketAddr };
 use std::io::BufReader;
 use argh::FromArgs;
+use tokio::time::timeout;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
@@ -42,7 +43,11 @@ struct Options {
 
     /// keep test time (s)
     #[argh(option, short = 'k')]
-    keep: Option<u64>
+    keep: Option<u64>,
+
+    /// timeout (s)
+    #[argh(option, short = 't')]
+    timeout: Option<u64>
 }
 
 
@@ -77,12 +82,14 @@ async fn main() -> io::Result<()> {
     };
     let (sender, mut queue) = mpsc::unbounded_channel();
     let keep = options.keep.map(Duration::from_secs);
+    let timeout = options.timeout.map(Duration::from_secs);
     let start = Instant::now();
 
     let ctx = Arc::new(Context {
         connector, addr,
         input, domain, content,
-        start, keep, sender
+        start, keep, timeout,
+        sender
     });
 
     for _ in 0..options.concurrent {
@@ -94,15 +101,47 @@ async fn main() -> io::Result<()> {
     drop(ctx);
 
     let mut count = 0;
+    let mut failed = 0;
+    let mut total = Duration::from_secs(0);
+    let mut handshake_total = Duration::from_secs(0);
+    let mut write_total = Duration::from_secs(0);
+    let mut read_total = Duration::from_secs(0);
+    let mut write_bytes_total = 0;
+    let mut read_bytes_total = 0;
+    let mut list = Vec::with_capacity(options.concurrent);
+
     while let Some(j) = queue.recv().await {
-        j.await??;
         count += 1;
+
+        match j.await? {
+            Ok(stat) => {
+                let dur = stat.read_ok.duration_since(stat.start);
+                total += dur;
+                handshake_total = stat.handshake_ok.duration_since(stat.start);
+                write_total += stat.write_ok.duration_since(stat.handshake_ok);
+                read_total += stat.read_ok.duration_since(stat.write_ok);
+                write_bytes_total += stat.write_bytes;
+                read_bytes_total += stat.read_bytes;
+                list.push(dur);
+            },
+            Err(err) => {
+                eprintln!("{:?}", err);
+                failed += 1;
+            }
+        }
     }
 
-    let dur = start.elapsed().as_secs_f64();
+    let dur = start.elapsed();
+    let succeeded = count - failed;
+    let stat = latency(&mut list);
 
-    println!("result: {}/{}s", count, dur);
-    println!("mean: {} per secs", (count as f64) / dur);
+    println!("{} requests in {}s, {} failed", count, dur.as_secs_f64(), failed);
+
+    println!("{:#?}", stat);
+
+    println!("handshake mean: {}s", handshake_total.as_secs_f64() / (succeeded as f64));
+    println!("write/sec: {}", (write_bytes_total as f64) / write_total.as_secs_f64());
+    println!("read/sec: {}", (read_bytes_total as f64) / read_total.as_secs_f64());
 
     Ok(())
 }
@@ -115,29 +154,69 @@ struct Context {
     content: String,
     start: Instant,
     keep: Option<Duration>,
-    sender: mpsc::UnboundedSender<JoinHandle<io::Result<()>>>
+    timeout: Option<Duration>,
+    sender: mpsc::UnboundedSender<JoinHandle<io::Result<Stat>>>
+}
+
+struct Stat {
+    start: Instant,
+    handshake_ok: Instant,
+    write_ok: Instant,
+    read_ok: Instant,
+    write_bytes: u64,
+    read_bytes: u64
+}
+
+#[derive(Debug)]
+struct StatResult {
+    min: Duration,
+    max: Duration,
+    avg: Duration,
+    p50: Duration,
+    p75: Duration,
+    p90: Duration,
+    p99: Duration,
+    stdev: f64
 }
 
 fn spawn_task(ctx: Arc<Context>) {
     let sender = ctx.sender.clone();
 
     let join = tokio::spawn(async move {
-        let stream = TcpStream::connect(&ctx.addr).await?;
-        let mut output = sink();
+        let fut = async {
+            let start = Instant::now();
 
-        let domain = DNSNameRef::try_from_ascii_str(&ctx.domain)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
+            let stream = TcpStream::connect(&ctx.addr).await?;
+            let mut input = io::Cursor::new(&ctx.input);
+            let mut output = sink();
 
-        let mut stream = ctx.connector.connect(domain, stream).await?;
-        stream.write_all(ctx.content.as_bytes()).await?;
+            let domain = DNSNameRef::try_from_ascii_str(&ctx.domain)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
+            let mut stream = ctx.connector.connect(domain, stream).await?;
+            let handshake_ok = Instant::now();
 
-        stream.write_all(&*ctx.input).await?;
-        stream.shutdown().await?;
+            stream.write_all(ctx.content.as_bytes()).await?;
+            let write_bytes = copy(&mut input, &mut stream).await?;
+            stream.shutdown().await?;
+            let write_ok = Instant::now();
 
-        copy(&mut stream, &mut output).await?;
+            let read_bytes = copy(&mut stream, &mut output).await?;
+            let read_ok = Instant::now();
 
-        // release fd
-        drop(stream);
+            let stat = Stat {
+                start, handshake_ok, write_ok, read_ok,
+                write_bytes, read_bytes
+            };
+            Ok(stat) as io::Result<Stat>
+        };
+
+        let ret = if let Some(dur) = ctx.timeout {
+            timeout(dur, fut).await
+                .map_err(Into::into)
+                .and_then(|ret| ret)
+        } else {
+            fut.await
+        };
 
         if let Some(keep) = ctx.keep {
             if ctx.start.elapsed() <= keep {
@@ -145,8 +224,47 @@ fn spawn_task(ctx: Arc<Context>) {
             }
         }
 
-        Ok(()) as io::Result<()>
+        ret
     });
 
     let _ = sender.send(join);
+}
+
+fn latency(list: &mut [Duration]) -> Option<StatResult> {
+    fn p(list: &[Duration], pct: f64) -> Duration {
+        let n = list.len() as f64;
+        let n = n * pct;
+        let n = n.ceil() as usize;
+        list[n]
+    }
+
+    list.sort();
+
+    let min = list.first().copied()?;
+    let max = list.last().copied()?;
+
+    let avg = {
+        let total: Duration = list.iter().sum();
+        total / (list.len() as u32)
+    };
+
+    let stdev = {
+        let n: f64 = list.iter()
+            .map(|dur| dur.as_secs_f64() - avg.as_secs_f64())
+            .map(|n| n.powi(2))
+            .sum();
+        let n = n / (list.len() as f64);
+        n.sqrt()
+    };
+
+    let p50 = p(list, 0.5);
+    let p75 = p(list, 0.75);
+    let p90 = p(list, 0.90);
+    let p99 = p(list, 0.99);
+
+    Some(StatResult {
+        min, max, avg,
+        p50, p75, p90, p99,
+        stdev
+    })
 }

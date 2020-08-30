@@ -1,4 +1,7 @@
 use std::io;
+use std::pin::Pin;
+use std::future::Future;
+use std::task::{ Context as Ctx, Poll };
 use std::time::{ Duration, Instant };
 use std::fs::{ self, File };
 use std::path::PathBuf;
@@ -10,7 +13,7 @@ use tokio::time::timeout;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
-use tokio::io::{ AsyncWriteExt, copy, sink };
+use tokio::io::{ AsyncWriteExt, split, copy, sink };
 use tokio_rustls::{ TlsConnector, rustls::ClientConfig, webpki::DNSNameRef };
 
 
@@ -104,8 +107,7 @@ async fn main() -> io::Result<()> {
     let mut failed = 0;
     let mut total = Duration::from_secs(0);
     let mut handshake_total = Duration::from_secs(0);
-    let mut write_total = Duration::from_secs(0);
-    let mut read_total = Duration::from_secs(0);
+    let mut end_total = Duration::from_secs(0);
     let mut write_bytes_total = 0;
     let mut read_bytes_total = 0;
     let mut list = Vec::with_capacity(options.concurrent);
@@ -115,11 +117,10 @@ async fn main() -> io::Result<()> {
 
         match j.await? {
             Ok(stat) => {
-                let dur = stat.read_ok.duration_since(stat.start);
+                let dur = stat.end.duration_since(stat.start);
                 total += dur;
                 handshake_total = stat.handshake_ok.duration_since(stat.start);
-                write_total += stat.write_ok.duration_since(stat.handshake_ok);
-                read_total += stat.read_ok.duration_since(stat.write_ok);
+                end_total += stat.end.duration_since(stat.handshake_ok);
                 write_bytes_total += stat.write_bytes;
                 read_bytes_total += stat.read_bytes;
                 list.push(dur);
@@ -140,8 +141,8 @@ async fn main() -> io::Result<()> {
     println!("{:#?}", stat);
 
     println!("handshake mean: {:?}", handshake_total / (succeeded as u32));
-    println!("write/sec: {}", (write_bytes_total as f64) / write_total.as_secs_f64());
-    println!("read/sec: {}", (read_bytes_total as f64) / read_total.as_secs_f64());
+    println!("write/sec: {}", (write_bytes_total as f64) / end_total.as_secs_f64());
+    println!("read/sec: {}", (read_bytes_total as f64) / end_total.as_secs_f64());
 
     Ok(())
 }
@@ -161,8 +162,7 @@ struct Context {
 struct Stat {
     start: Instant,
     handshake_ok: Instant,
-    write_ok: Instant,
-    read_ok: Instant,
+    end: Instant,
     write_bytes: u64,
     read_bytes: u64
 }
@@ -196,15 +196,35 @@ fn spawn_task(ctx: Arc<Context>) {
             let handshake_ok = Instant::now();
 
             stream.write_all(ctx.content.as_bytes()).await?;
-            let write_bytes = copy(&mut input, &mut stream).await?;
-            stream.shutdown().await?;
-            let write_ok = Instant::now();
 
-            let read_bytes = copy(&mut stream, &mut output).await?;
-            let read_ok = Instant::now();
+            let (mut reader, mut writer) = split(stream);
+            let mut read_fused = false;
+            let mut write_fused = false;
+            let mut write_bytes = ctx.content.len() as u64;
+            let mut read_bytes = 0;
+            while !read_fused || !write_fused {
+                tokio::select!{
+                    ret = async {
+                        if !read_fused { copy(&mut reader, &mut output).await }
+                        else { Pending2.await }
+                    } => {
+                        read_bytes = ret?;
+                        read_fused = true;
+                    },
+                    ret = async {
+                        if !write_fused { copy(&mut input, &mut writer).await }
+                        else { Pending2.await }
+                    } => {
+                        write_bytes = ret?;
+                        writer.shutdown().await?;
+                        write_fused = true;
+                    }
+                }
+            }
+            let end = Instant::now();
 
             let stat = Stat {
-                start, handshake_ok, write_ok, read_ok,
+                start, handshake_ok, end,
                 write_bytes, read_bytes
             };
             Ok(stat) as io::Result<Stat>
@@ -267,4 +287,14 @@ fn latency(list: &mut [Duration]) -> Option<StatResult> {
         p50, p75, p90, p99,
         stdev
     })
+}
+
+struct Pending2;
+
+impl Future for Pending2 {
+    type Output = io::Result<u64>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Ctx<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
 }

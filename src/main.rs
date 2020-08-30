@@ -139,7 +139,7 @@ async fn main() -> io::Result<()> {
 
     println!("{:#?}", stat);
 
-    println!("handshake mean: {}s", handshake_total.as_secs_f64() / (succeeded as f64));
+    println!("handshake mean: {:?}", handshake_total / (succeeded as u32));
     println!("write/sec: {}", (write_bytes_total as f64) / write_total.as_secs_f64());
     println!("read/sec: {}", (read_bytes_total as f64) / read_total.as_secs_f64());
 

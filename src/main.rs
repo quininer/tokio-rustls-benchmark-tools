@@ -46,11 +46,11 @@ struct Options {
 
     /// keep test time (s)
     #[argh(option, short = 'k')]
-    keep: Option<u64>,
+    keep: Option<f64>,
 
     /// timeout (s)
     #[argh(option, short = 't')]
-    timeout: Option<u64>
+    timeout: Option<f64>
 }
 
 
@@ -84,8 +84,8 @@ async fn main() -> io::Result<()> {
         Vec::new()
     };
     let (sender, mut queue) = mpsc::unbounded_channel();
-    let keep = options.keep.map(Duration::from_secs);
-    let timeout = options.timeout.map(Duration::from_secs);
+    let keep = options.keep.map(Duration::from_secs_f64);
+    let timeout = options.timeout.map(Duration::from_secs_f64);
     let start = Instant::now();
 
     let ctx = Arc::new(Context {
@@ -125,9 +125,10 @@ async fn main() -> io::Result<()> {
                 read_bytes_total += stat.read_bytes;
                 list.push(dur);
             },
-            Err(err) => {
+            Err((err, dur)) => {
                 eprintln!("{:?}", err);
                 failed += 1;
+                list.push(dur);
             }
         }
     }
@@ -156,7 +157,7 @@ struct Context {
     start: Instant,
     keep: Option<Duration>,
     timeout: Option<Duration>,
-    sender: mpsc::UnboundedSender<JoinHandle<io::Result<Stat>>>
+    sender: mpsc::UnboundedSender<JoinHandle<Result<Stat, (io::Error, Duration)>>>
 }
 
 struct Stat {
@@ -183,9 +184,9 @@ fn spawn_task(ctx: Arc<Context>) {
     let sender = ctx.sender.clone();
 
     let join = tokio::spawn(async move {
-        let fut = async {
-            let start = Instant::now();
+        let start = Instant::now();
 
+        let fut = async {
             let stream = TcpStream::connect(&ctx.addr).await?;
             let mut input = io::Cursor::new(&ctx.input);
             let mut output = sink();
@@ -237,6 +238,7 @@ fn spawn_task(ctx: Arc<Context>) {
         } else {
             fut.await
         };
+        let ret = ret.map_err(|err| (err, start.elapsed()));
 
         if let Some(keep) = ctx.keep {
             if ctx.start.elapsed() <= keep {
